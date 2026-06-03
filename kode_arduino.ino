@@ -1,45 +1,158 @@
 #include <WiFi.h>
-#include <PubSubClient.h>
 #include <AntaresESPMQTT.h>
-#include <WiFiClientSecure.h>
-#include <UniversalTelegramBot.h>
 #include <time.h>
 #include <sys/time.h>
-
-// ================= ANTARES =================
-
-#define ACCESSKEY ""
+#include <math.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+// ================= WIFI =================
 
 #define WIFISSID "2309106082"
 #define PASSWORD "ibnuibnu2004"
 
+// ================= ANTARES =================
+
+#define ACCESSKEY ""
 #define projectName "SmartTandon"
 #define deviceName "TandonAir"
 
 AntaresESPMQTT antares(ACCESSKEY);
 
-// ================= TELEGRAM UNIVERSAL BOT =================
-const char* BOT_TOKEN = "8048484142:AAHdxK967uwALedOFJbIJwBK56sXHMRLqoI";
-const char* CHAT_ID = "-5288176995";
+// ================= TELEGRAM =================
+
+#define BOT_TOKEN  "8048484142:AAHdxK967uwALedOFJbIJwBK56sXHMRLqoI"
+#define CHAT_ID "-5288176995"
 
 WiFiClientSecure telegramClient;
-UniversalTelegramBot bot(BOT_TOKEN, telegramClient);
 
-String lastTelegramAlertStatus = "";
+UniversalTelegramBot bot(
+  BOT_TOKEN,
+  telegramClient);
 
-int telegramHttpCode = 0;
 
-unsigned long telegramLatencyMs = 0;
+// ================= MQTT EMQX =================
 
-// ================= EMQX CONTROL =================
+const char* mqttServer = "broker.emqx.io";
+const int mqttPort = 1883;
 
-const char* mqtt_server = "broker.emqx.io";
-const int mqtt_port = 1883;
+const char* topicBuzzer =
+  "iot7/tandon/buzzer";
 
-const char* topic_buzzer = "iot7/tandon/buzzer";
+WiFiClient mqttWifiClient;
 
-WiFiClient emqxWifiClient;
-PubSubClient mqttControl(emqxWifiClient);
+PubSubClient mqttClient(mqttWifiClient);
+
+// ================= STATUS =================
+
+bool notifLowSent = false;
+bool notifFullSent = false;
+bool notif100Sent = false;
+
+bool buzzerManual = true;
+
+// TAMBAHAN
+bool buzzerMuted = false;
+
+// ================= TELEGRAM =================
+
+void kirimTelegram(String pesan) {
+
+  bot.sendMessage(
+    CHAT_ID,
+    pesan,
+    "");
+
+  Serial.println(
+    "NOTIF TELEGRAM TERKIRIM");
+}
+
+// ================= MQTT CALLBACK =================
+
+void callback(
+  char* topic,
+  byte* payload,
+  unsigned int length) {
+
+  String message = "";
+
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+
+  Serial.println("====================");
+  Serial.println("MQTT DATA DITERIMA");
+  Serial.println(message);
+
+  DynamicJsonDocument doc(128);
+
+  DeserializationError error =
+    deserializeJson(doc, message);
+
+  if (error) {
+
+    Serial.println("JSON ERROR");
+
+    return;
+  }
+
+  buzzerManual = doc["buzzer"];
+
+  // jika user OFF
+  if (!buzzerManual) {
+
+    buzzerMuted = true;
+
+  } else {
+
+    buzzerMuted = false;
+  }
+
+  Serial.print("BUZZER MANUAL: ");
+  Serial.println(buzzerManual);
+}
+
+// ================= MQTT CONNECT =================
+
+void connectMQTT() {
+
+  while (!mqttClient.connected()) {
+
+    Serial.println(
+      "CONNECT MQTT EMQX...");
+
+    String clientId =
+      "ESP32_" + String(random(1000, 9999));
+
+    if (
+      mqttClient.connect(
+        clientId.c_str())) {
+
+      Serial.println(
+        "MQTT CONNECTED");
+
+      mqttClient.subscribe(
+        topicBuzzer);
+
+      Serial.print(
+        "SUBSCRIBE: ");
+
+      Serial.println(
+        topicBuzzer);
+
+    } else {
+
+      Serial.print(
+        "FAILED rc=");
+
+      Serial.println(
+        mqttClient.state());
+
+      delay(2000);
+    }
+  }
+}
 
 // ================= PIN =================
 
@@ -54,30 +167,14 @@ PubSubClient mqttControl(emqxWifiClient);
 
 // ================= TANDON =================
 
-const int tinggiTandon = 18;
+const float tinggiTandon = 15.0;
 
-// ================= DATA SENSOR =================
+// ================= INTERVAL =================
 
-float jarakRaw = 0;
+const unsigned long publishIntervalMs = 2000;
+unsigned long lastPublish = 0;
 
-// ================= PENGUJIAN =================
-
-unsigned long sensorLatencyMs = 0;
-unsigned long antaresPublishLatencyMs = 0;
-
-int emqxReconnectCount = 0;
-
-String wifiStatusText = "DISCONNECTED";
-String emqxStatusText = "DISCONNECTED";
-
-// ================= BUZZER CONTROL =================
-
-bool manualOverride = false;
-bool manualBuzzer = false;
-
-String lastStatusAir = "";
-
-// ================= TIME / NTP =================
+// ================= TIME =================
 
 uint64_t getUnixMillis() {
   struct timeval tv;
@@ -86,10 +183,33 @@ uint64_t getUnixMillis() {
   return ((uint64_t)tv.tv_sec * 1000ULL) + (tv.tv_usec / 1000);
 }
 
-void setupTime() {
-  configTime(8 * 3600, 0, "pool.ntp.org", "time.google.com");
+// Untuk tampilan jam lokal di Serial Monitor.
+// sent_at_ms tetap UTC epoch millis.
+String getTimeText(uint64_t unixMs) {
+  time_t rawTime = (unixMs / 1000) + (8 * 3600);
+  int ms = unixMs % 1000;
 
-  Serial.print("Sinkronisasi waktu NTP");
+  struct tm timeInfo;
+  gmtime_r(&rawTime, &timeInfo);
+
+  char buffer[32];
+
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "%02d:%02d:%02d.%03d",
+    timeInfo.tm_hour,
+    timeInfo.tm_min,
+    timeInfo.tm_sec,
+    ms);
+
+  return String(buffer);
+}
+
+void setupTime() {
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+
+  Serial.print("Sinkronisasi NTP");
 
   int retry = 0;
 
@@ -112,168 +232,247 @@ void setupTime() {
 
 float bacaJarak() {
   digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
+  delayMicroseconds(5);
 
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
 
   digitalWrite(TRIG_PIN, LOW);
 
-  long durasi = pulseIn(ECHO_PIN, HIGH, 30000);
+  long durasi = pulseIn(ECHO_PIN, HIGH, 40000);
 
   if (durasi == 0) {
-    Serial.println("Sensor gagal membaca");
-    jarakRaw = 0;
     return -1;
   }
 
   float jarak = durasi * 0.0343 / 2.0;
 
-  jarakRaw = jarak;
-
   return jarak;
 }
 
-// ================= TELEGRAM =================
+// ================= LOGIC =================
 
-void sendTelegramMessage(String message) {
+String getStatusAir(int waterLevel) {
+  if (waterLevel <= 34) {
+    return "LOW";
+  } else if (waterLevel <= 70) {
+    return "MEDIUM";
+  } else {
+    return "FULL";
+  }
+}
 
-  if (WiFi.status() != WL_CONNECTED) {
+void updateOutput(
+  String statusAir,
+  int& ledMerah,
+  int& ledKuning,
+  int& ledHijau,
+  int& buzzerStatus) {
 
-    telegramHttpCode = 0;
-    telegramLatencyMs = 0;
+  ledMerah = 0;
+  ledKuning = 0;
+  ledHijau = 0;
+  buzzerStatus = 0;
 
+  // ================= LED =================
+
+  if (statusAir == "LOW") {
+
+    ledMerah = 1;
+
+  } else if (statusAir == "MEDIUM") {
+
+    ledKuning = 1;
+
+  } else if (statusAir == "FULL") {
+
+    ledHijau = 1;
+  }
+
+  // ================= RESET MUTE =================
+  // jika air turun dari FULL
+  // mute otomatis direset
+
+  if (statusAir != "FULL") {
+
+    buzzerMuted = false;
+  }
+
+  // ================= BUZZER =================
+
+  if (statusAir == "FULL" && !buzzerMuted) {
+
+    buzzerStatus = 1;
+  }
+
+  digitalWrite(LED_MERAH, ledMerah);
+  digitalWrite(LED_KUNING, ledKuning);
+  digitalWrite(LED_HIJAU, ledHijau);
+
+  digitalWrite(BUZZER, buzzerStatus);
+}
+
+// ================= PUBLISH ANTARES =================
+
+void publishData() {
+  float jarakAirCm = bacaJarak();
+
+  if (jarakAirCm < 0) {
+    Serial.println("Sensor gagal membaca. Data tidak dikirim.");
     return;
   }
 
-  unsigned long telegramStart = millis();
+  float ketinggianAirCm = tinggiTandon - jarakAirCm;
+  ketinggianAirCm = constrain(ketinggianAirCm, 0, tinggiTandon);
 
-  bool sent =
-    bot.sendMessage(String(CHAT_ID), message, "");
+  int waterLevel = round((ketinggianAirCm / tinggiTandon) * 100.0);
+  waterLevel = constrain(waterLevel, 0, 100);
 
-  telegramLatencyMs =
-    millis() - telegramStart;
+  String statusAir = getStatusAir(waterLevel);
 
-  telegramHttpCode = sent ? 200 : 0;
-}
+  // ================= TELEGRAM =================
 
-void checkTelegramNotification(
-  int waterLevel,
-  float jarak
-) {
+  // AIR HAMPIR HABIS
 
-  String currentAlertStatus;
+  if (waterLevel <= 10) {
 
-  if (waterLevel == 100) {
-    currentAlertStatus = "FULL_100";
-  }
-  else if (waterLevel > 70) {
-    currentAlertStatus = "HIGH";
-  }
-  else if (waterLevel < 35) {
-    currentAlertStatus = "LOW";
-  }
-  else {
-    currentAlertStatus = "NORMAL";
-  }
+    if (!notifLowSent) {
 
-  if (currentAlertStatus ==
-      lastTelegramAlertStatus) {
-    return;
-  }
+      kirimTelegram(
+        "⚠️ AIR HAMPIR HABIS\n"
+        "Level: "
+        + String(waterLevel)
+        + "%");
 
-  lastTelegramAlertStatus =
-    currentAlertStatus;
-
-  if (currentAlertStatus == "LOW") {
-
-    sendTelegramMessage(
-      "PERINGATAN SMART TANDON\n\n"
-      "Status: Air rendah\n"
-      "Level air: " + String(waterLevel) + "%\n"
-      "Jarak sensor: " + String(jarak, 2) + " cm"
-    );
-  }
-
-  else if (currentAlertStatus == "HIGH") {
-
-    sendTelegramMessage(
-      "PERINGATAN SMART TANDON\n\n"
-      "Status: Air tinggi\n"
-      "Level air: " + String(waterLevel) + "%\n"
-      "Jarak sensor: " + String(jarak, 2) + " cm"
-    );
-  }
-
-  else if (currentAlertStatus == "FULL_100") {
-
-    sendTelegramMessage(
-      "SMART TANDON PENUH\n\n"
-      "Level air: 100%"
-    );
-  }
-}
-
-// ================= CALLBACK MQTT =================
-
-void callback(
-  char* topic,
-  byte* payload,
-  unsigned int length
-) {
-
-  String message = "";
-
-  for (int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-
-  if (String(topic) == topic_buzzer) {
-
-    manualOverride = true;
-
-    if (
-      message.indexOf("true") != -1 ||
-      message.indexOf("1") != -1
-    ) {
-      manualBuzzer = true;
+      notifLowSent = true;
     }
 
-    else if (
-      message.indexOf("false") != -1 ||
-      message.indexOf("0") != -1
-    ) {
-      manualBuzzer = false;
-    }
+  } else {
+
+    notifLowSent = false;
   }
-}
 
-// ================= RECONNECT MQTT =================
+  // FULL
 
-void reconnectEMQX() {
+  if (statusAir == "FULL") {
 
-  while (!mqttControl.connected()) {
+    if (!notifFullSent) {
 
-    String clientId = "esp32_tandon_";
-    clientId += String(random(0xffff), HEX);
+      kirimTelegram(
+        "✅ TANDON FULL\n"
+        "Level: "
+        + String(waterLevel)
+        + "%");
 
-    if (mqttControl.connect(clientId.c_str())) {
-
-      emqxReconnectCount++;
-
-      mqttControl.subscribe(topic_buzzer);
-
-    } else {
-
-      delay(3000);
+      notifFullSent = true;
     }
+
+  } else {
+
+    notifFullSent = false;
   }
+
+  // 100%
+
+  if (waterLevel >= 100) {
+
+    if (!notif100Sent) {
+
+      kirimTelegram(
+        "🚰 AIR SUDAH 100%");
+
+      notif100Sent = true;
+    }
+
+  } else {
+
+    notif100Sent = false;
+  }
+
+  int ledMerah = 0;
+  int ledKuning = 0;
+  int ledHijau = 0;
+  int buzzerStatus = 0;
+
+  updateOutput(
+    statusAir,
+    ledMerah,
+    ledKuning,
+    ledHijau,
+    buzzerStatus);
+
+  uint64_t sentAtMs = getUnixMillis();
+  String waktuKirimData = getTimeText(sentAtMs);
+
+  char sentAtBuffer[24];
+
+  snprintf(
+    sentAtBuffer,
+    sizeof(sentAtBuffer),
+    "%llu",
+    (unsigned long long)sentAtMs);
+
+  antares.checkMqttConnection();
+
+  // ================= DATA UNTUK FLUTTER =================
+
+  antares.add("water_level", waterLevel);
+  antares.add("status_air", statusAir);
+
+  antares.add("led_merah", ledMerah);
+  antares.add("led_kuning", ledKuning);
+  antares.add("led_hijau", ledHijau);
+
+  antares.add("buzzer", buzzerStatus);
+
+  // Dipakai Flutter untuk hitung latensi
+  antares.add("sent_at_ms", sentAtBuffer);
+
+  // Tambahan biar mudah dibaca
+  antares.add("waktu_kirim_data", waktuKirimData);
+  antares.add("jarak_air_cm", jarakAirCm);
+  antares.add(
+    "buzzer_manual",
+    buzzerManual);
+
+  antares.publish(projectName, deviceName);
+
+  // ================= SERIAL MONITOR SIMPLE =================
+
+  Serial.println("====================================");
+  Serial.print("Water Level     : ");
+  Serial.print(waterLevel);
+  Serial.println(" %");
+
+  Serial.print("Status Air      : ");
+  Serial.println(statusAir);
+
+  Serial.print("Jarak Air       : ");
+  Serial.print(jarakAirCm, 2);
+  Serial.println(" cm");
+
+  Serial.print("LED Merah       : ");
+  Serial.println(ledMerah);
+
+  Serial.print("LED Kuning      : ");
+  Serial.println(ledKuning);
+
+  Serial.print("LED Hijau       : ");
+  Serial.println(ledHijau);
+
+  Serial.print("Buzzer          : ");
+  Serial.println(buzzerStatus);
+
+  Serial.print("Waktu Kirim     : ");
+  Serial.println(waktuKirimData);
+
+  Serial.print("sent_at_ms      : ");
+  Serial.println(sentAtBuffer);
 }
 
 // ================= SETUP =================
 
 void setup() {
-
   Serial.begin(115200);
 
   pinMode(TRIG_PIN, OUTPUT);
@@ -285,269 +484,69 @@ void setup() {
 
   pinMode(BUZZER, OUTPUT);
 
+  digitalWrite(LED_MERAH, LOW);
+  digitalWrite(LED_KUNING, LOW);
+  digitalWrite(LED_HIJAU, LOW);
   digitalWrite(BUZZER, LOW);
 
-  antares.setDebug(true);
+  antares.setDebug(false);
 
   antares.wifiConnection(
     WIFISSID,
-    PASSWORD
-  );
+    PASSWORD);
 
   setupTime();
 
-  telegramClient.setInsecure();
-
   antares.setMqttServer();
 
-  mqttControl.setServer(
-    mqtt_server,
-    mqtt_port
-  );
+  // ================= TELEGRAM =================
 
-  mqttControl.setCallback(callback);
+  telegramClient.setInsecure();
 
+  // ================= MQTT =================
+
+  mqttClient.setServer(
+    mqttServer,
+    mqttPort);
+
+  mqttClient.setCallback(
+    callback);
+
+  connectMQTT();
+
+  Serial.println();
   Serial.println("SMART TANDON READY");
+  Serial.println("Payload Antares dibuat simple.");
+  Serial.println("Data: TandonModel + waktu_kirim_data + jarak_air_cm");
+  Serial.println();
 }
 
 // ================= LOOP =================
 
 void loop() {
 
-  antares.checkMqttConnection();
+  if (WiFi.status() != WL_CONNECTED) {
 
-  if (!mqttControl.connected()) {
-    reconnectEMQX();
+    WiFi.reconnect();
   }
 
-  mqttControl.loop();
+  if (!mqttClient.connected()) {
 
-  // ================= SENSOR =================
-
-  unsigned long sensorStart = millis();
-
-  float jarak = bacaJarak();
-
-  sensorLatencyMs =
-    millis() - sensorStart;
-
-  if (jarak < 0) {
-    jarak = tinggiTandon;
+    connectMQTT();
   }
 
-  int waterLevel =
-    round(
-      ((tinggiTandon - jarak)
-      / tinggiTandon) * 100.0
-    );
+  mqttClient.loop();
 
-  waterLevel =
-    constrain(waterLevel, 0, 100);
-
-  // ================= TELEGRAM =================
-
-  checkTelegramNotification(
-    waterLevel,
-    jarak
-  );
-
-  String statusAir;
-
-  int ledMerah = 0;
-  int ledKuning = 0;
-  int ledHijau = 0;
-
-  int autoBuzzer = 0;
-
-  // ================= LOGIC =================
-
-  if (waterLevel < 35) {
-
-    statusAir = "LOW";
-
-    ledMerah = 1;
-  }
-
-  else if (waterLevel <= 70) {
-
-    statusAir = "MEDIUM";
-
-    ledKuning = 1;
-  }
-
-  else {
-
-    statusAir = "FULL";
-
-    ledHijau = 1;
-
-    autoBuzzer = 1;
-  }
-
-  // ================= RESET MANUAL =================
+  unsigned long now = millis();
 
   if (
-    lastStatusAir != "FULL" &&
-    statusAir == "FULL"
-  ) {
+    now - lastPublish
+    >= publishIntervalMs) {
 
-    manualOverride = false;
-    manualBuzzer = false;
+    lastPublish = now;
+
+    publishData();
   }
 
-  lastStatusAir = statusAir;
-
-  // ================= OUTPUT =================
-
-  digitalWrite(LED_MERAH, ledMerah);
-  digitalWrite(LED_KUNING, ledKuning);
-  digitalWrite(LED_HIJAU, ledHijau);
-
-  int buzzerStatus;
-
-  if (manualOverride) {
-    buzzerStatus =
-      manualBuzzer ? 1 : 0;
-  } else {
-    buzzerStatus = autoBuzzer;
-  }
-
-  digitalWrite(BUZZER, buzzerStatus);
-
-  // ================= STATUS =================
-
-  wifiStatusText =
-    WiFi.status() == WL_CONNECTED
-    ? "CONNECTED"
-    : "DISCONNECTED";
-
-  emqxStatusText =
-    mqttControl.connected()
-    ? "CONNECTED"
-    : "DISCONNECTED";
-
-  // ================= TIMESTAMP =================
-
-  uint64_t sentAtMs = getUnixMillis();
-
-  char sentAtBuffer[24];
-
-  snprintf(
-    sentAtBuffer,
-    sizeof(sentAtBuffer),
-    "%llu",
-    sentAtMs
-  );
-
-  // ================= ANTARES =================
-
-  antares.add("water_level", waterLevel);
-  antares.add("status_air", statusAir);
-
-  antares.add("led_merah", ledMerah);
-  antares.add("led_kuning", ledKuning);
-  antares.add("led_hijau", ledHijau);
-
-  antares.add("buzzer", buzzerStatus);
-
-  antares.add("auto_buzzer", autoBuzzer);
-
-  antares.add(
-    "manual_override",
-    manualOverride ? 1 : 0
-  );
-
-  antares.add(
-    "manual_buzzer",
-    manualBuzzer ? 1 : 0
-  );
-
-  antares.add("jarak_air_cm", jarak);
-
-  // ================= SENSOR TEST =================
-
-  antares.add("jarak_raw_cm", jarakRaw);
-
-  antares.add(
-    "sensor_latency_ms",
-    (int)sensorLatencyMs
-  );
-
-  // ================= LATENCY TEST =================
-
-  antares.add("sent_at_ms", sentAtBuffer);
-
-  antares.add(
-    "antares_publish_latency_ms",
-    (int)antaresPublishLatencyMs
-  );
-
-  antares.add(
-    "telegram_latency_ms",
-    (int)telegramLatencyMs
-  );
-
-  // ================= CONNECTIVITY =================
-
-  antares.add(
-    "wifi_status",
-    wifiStatusText
-  );
-
-  antares.add(
-    "wifi_rssi",
-    WiFi.RSSI()
-  );
-
-  antares.add(
-    "emqx_status",
-    emqxStatusText
-  );
-
-  antares.add(
-    "emqx_reconnect_count",
-    emqxReconnectCount
-  );
-
-  antares.add(
-    "telegram_http_code",
-    telegramHttpCode
-  );
-
-  // ================= PUBLISH =================
-
-  unsigned long publishStart = millis();
-
-  antares.publish(
-    projectName,
-    deviceName
-  );
-
-  antaresPublishLatencyMs =
-    millis() - publishStart;
-
-  // ================= SERIAL =================
-
-  Serial.println("====================");
-
-  Serial.print("Water Level: ");
-  Serial.print(waterLevel);
-  Serial.println("%");
-
-  Serial.print("Status Air: ");
-  Serial.println(statusAir);
-
-  Serial.print("Sensor Latency: ");
-  Serial.print(sensorLatencyMs);
-  Serial.println(" ms");
-
-  Serial.print("Antares Publish: ");
-  Serial.print(antaresPublishLatencyMs);
-  Serial.println(" ms");
-
-  Serial.print("Telegram Latency: ");
-  Serial.print(telegramLatencyMs);
-  Serial.println(" ms");
-
-  delay(5000);
+  delay(10);
 }
