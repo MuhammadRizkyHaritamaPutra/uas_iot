@@ -21,6 +21,8 @@ class HomePage extends ConsumerWidget {
             final double progressValue =
                 data.waterLevel.clamp(0, 100).toDouble() / 100;
 
+            final int latencyMs = data.flutterLatencyMs;
+
             return SingleChildScrollView(
               padding: const EdgeInsets.all(20),
               child: Column(
@@ -254,6 +256,49 @@ class HomePage extends ConsumerWidget {
                               data.ledHijau == 1 ? "ON" : "OFF",
                             ),
                           ],
+                        ),
+
+                        const SizedBox(height: 20),
+
+                        // ================= LATENCY INFO =================
+
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(
+                            color: const Color(0xffF4F4F4),
+                            borderRadius: BorderRadius.circular(18),
+                          ),
+                          child: Row(
+                            children: [
+                              const CircleAvatar(
+                                backgroundColor: Colors.black,
+                                child: Icon(
+                                  Icons.speed,
+                                  color: Colors.white,
+                                ),
+                              ),
+
+                              const SizedBox(width: 12),
+
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    "$latencyMs ms",
+                                    style: const TextStyle(
+                                      fontSize: 20,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+
+                                  const Text(
+                                    "Latency ESP32 ke Flutter",
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
                         ),
                       ],
                     ),
