@@ -10,7 +10,7 @@ class MQTTService {
   // ================= CONFIG =================
 
   static const String accessKey =
-      "2a5f5a0e1e2f03aa:c131d3a03328c48e";
+      "";
 
   static const String broker = "mqtt.antares.id";
 
